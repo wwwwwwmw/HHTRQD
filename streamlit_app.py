@@ -251,35 +251,6 @@ def main() -> None:
 
     df = add_risk_label(df_raw)
 
-    # UI filters
-    with st.sidebar:
-        st.header("Bộ lọc")
-
-        manufacturer_values = ["(All)"]
-        if "manufacturer" in df.columns:
-            manufacturer_values += sorted(df["manufacturer"].astype("string").unique().tolist())
-        manufacturer = st.selectbox("Hãng xe", manufacturer_values)
-
-        if "year" in df.columns and len(df):
-            y_min, y_max = int(df["year"].min()), int(df["year"].max())
-        else:
-            y_min, y_max = 1990, 2026
-        year_range = st.slider("Năm sản xuất", min_value=y_min, max_value=y_max, value=(y_min, y_max))
-
-        if "price" in df.columns and len(df):
-            p_min, p_max = float(df["price"].min()), float(df["price"].quantile(0.99))
-        else:
-            p_min, p_max = 0.0, 100000.0
-        price_range = st.slider("Giá", min_value=float(p_min), max_value=float(p_max), value=(float(p_min), float(p_max)))
-
-        if "mileage" in df.columns and len(df):
-            m_max_default = float(df["mileage"].quantile(0.99))
-        else:
-            m_max_default = 200000.0
-        max_mileage = st.slider("Mileage tối đa", min_value=0.0, max_value=float(max(m_max_default, 1.0)), value=float(m_max_default))
-
-    df_filtered = apply_filters(df, manufacturer, year_range, price_range, max_mileage)
-
     # AHP setup
     ahp_criteria = [
         "price",
@@ -293,9 +264,56 @@ def main() -> None:
         "price_drop",
     ]
 
-    with st.sidebar:
+    # Sidebar form: only run after user clicks "Đề xuất"
+    with st.sidebar.form("dss_form"):
+        st.header("Bộ lọc")
+
+        manufacturer_values = ["(All)"]
+        if "manufacturer" in df.columns:
+            manufacturer_values += sorted(df["manufacturer"].astype("string").unique().tolist())
+        manufacturer = st.selectbox("Hãng xe", manufacturer_values)
+
+        if "year" in df.columns and len(df):
+            y_min, y_max = int(df["year"].min()), int(df["year"].max())
+        else:
+            y_min, y_max = 1990, 2026
+        year_range = st.slider(
+            "Năm sản xuất (năm)",
+            min_value=y_min,
+            max_value=y_max,
+            value=(y_min, y_max),
+            format="%d",
+        )
+
+        if "price" in df.columns and len(df):
+            p_min = float(df["price"].min())
+            p_max = float(df["price"].quantile(0.99))
+        else:
+            p_min, p_max = 0.0, 100000.0
+        price_range = st.slider(
+            "Giá (USD)",
+            min_value=float(p_min),
+            max_value=float(p_max),
+            value=(float(p_min), float(p_max)),
+            format="$%.0f",
+        )
+
+        if "mileage" in df.columns and len(df):
+            m_max_default = float(df["mileage"].quantile(0.99))
+        else:
+            m_max_default = 200000.0
+        max_mileage = st.slider(
+            "Mileage tối đa (mile)",
+            min_value=0.0,
+            max_value=float(max(m_max_default, 1.0)),
+            value=float(m_max_default),
+            format="%.0f mi",
+        )
+
         st.header("AHP")
-        st.caption("Chấm điểm độ quan trọng (1 = ít quan trọng, 9 = rất quan trọng). Ứng dụng sẽ tự tạo ma trận AHP từ tỉ lệ điểm và tính trọng số.")
+        st.caption(
+            "Chấm điểm độ quan trọng (1 = ít quan trọng, 9 = rất quan trọng). Từ điểm này, hệ thống sẽ tính trọng số AHP và đề xuất xe."
+        )
 
         default_scores = {
             "price": 8,
@@ -313,7 +331,7 @@ def main() -> None:
         for c in ahp_criteria:
             criteria_scores[c] = int(
                 st.slider(
-                    f"{c}",
+                    f"{c} (1–9)",
                     min_value=1,
                     max_value=9,
                     value=int(default_scores.get(c, 5)),
@@ -321,50 +339,59 @@ def main() -> None:
                 )
             )
 
-    # Create a reciprocal pairwise matrix from user scores: A[i,j] = score_i / score_j
-    scores_vec = np.array([float(criteria_scores[c]) for c in ahp_criteria], dtype=float)
-    if np.all(scores_vec > 0):
-        A = scores_vec[:, None] / scores_vec[None, :]
-    else:
-        # Fallback: if something odd happens, use equal importance
-        A = np.ones((len(ahp_criteria), len(ahp_criteria)), dtype=float)
-
-    w, lambda_max, CI, CR = compute_ahp_weights(A)
-    ahp_weights = dict(zip(ahp_criteria, w))
-
-    # Train model on full df (not filtered) to keep stable; predict on filtered
-    try:
-        artifacts = train_ai_model(df)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-    # Score + predict
-    df_scored = df_filtered.copy()
-    df_scored["ahp_score"] = compute_ahp_score(df_scored, ahp_criteria, ahp_weights)
-
-    # Prepare df_ml for prediction with same columns used in notebook
-    df_ml_pred = df_scored.copy()
-    cat_cols = df_ml_pred.select_dtypes(include="string").columns
-    for col in cat_cols:
-        le = LabelEncoder()
-        df_ml_pred[col] = le.fit_transform(df_ml_pred[col].astype("string"))
-
-    df_scored["risk_pred"] = artifacts.model.predict(df_ml_pred[artifacts.features_ai])
-
-    with st.sidebar:
         st.header("Đề xuất")
         q = st.slider("Ngưỡng AHP (quantile)", min_value=0.5, max_value=0.9, value=0.7, step=0.05)
         top_n = st.number_input("Top N", min_value=5, max_value=50, value=10, step=1)
 
-    df_scored["recommendation"] = np.where(
-        (df_scored["ahp_score"] >= df_scored["ahp_score"].quantile(float(q))) & (df_scored["risk_pred"] == 0),
-        "RECOMMENDED",
-        "NOT_RECOMMENDED",
-    )
+        submitted = st.form_submit_button("Đề xuất")
 
-    ranked = df_scored[df_scored["risk_pred"] == 0]["ahp_score"].rank(method="dense", ascending=False)
-    df_scored["rank"] = ranked.fillna(0).astype(int)
+    if not submitted:
+        st.info("Chọn bộ lọc, chấm điểm AHP, sau đó nhấn 'Đề xuất' để chạy hệ thống.")
+        st.subheader("Xem nhanh dữ liệu")
+        st.dataframe(df.head(20), use_container_width=True)
+        return
+
+    with st.spinner("Đang chạy mô hình AI + AHP và tạo đề xuất..."):
+        df_filtered = apply_filters(df, manufacturer, year_range, price_range, max_mileage)
+
+        # Create a reciprocal pairwise matrix from user scores: A[i,j] = score_i / score_j
+        scores_vec = np.array([float(criteria_scores[c]) for c in ahp_criteria], dtype=float)
+        if np.all(scores_vec > 0):
+            A = scores_vec[:, None] / scores_vec[None, :]
+        else:
+            A = np.ones((len(ahp_criteria), len(ahp_criteria)), dtype=float)
+
+        w, lambda_max, CI, CR = compute_ahp_weights(A)
+        ahp_weights = dict(zip(ahp_criteria, w))
+
+        # Train model on full df (not filtered) to keep stable; predict on filtered
+        try:
+            artifacts = train_ai_model(df)
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
+        # Score + predict
+        df_scored = df_filtered.copy()
+        df_scored["ahp_score"] = compute_ahp_score(df_scored, ahp_criteria, ahp_weights)
+
+        # Prepare df_ml for prediction with same columns used in notebook
+        df_ml_pred = df_scored.copy()
+        cat_cols = df_ml_pred.select_dtypes(include="string").columns
+        for col in cat_cols:
+            le = LabelEncoder()
+            df_ml_pred[col] = le.fit_transform(df_ml_pred[col].astype("string"))
+
+        df_scored["risk_pred"] = artifacts.model.predict(df_ml_pred[artifacts.features_ai])
+
+        df_scored["recommendation"] = np.where(
+            (df_scored["ahp_score"] >= df_scored["ahp_score"].quantile(float(q))) & (df_scored["risk_pred"] == 0),
+            "RECOMMENDED",
+            "NOT_RECOMMENDED",
+        )
+
+        ranked = df_scored[df_scored["risk_pred"] == 0]["ahp_score"].rank(method="dense", ascending=False)
+        df_scored["rank"] = ranked.fillna(0).astype(int)
 
     # Layout
     col1, col2 = st.columns([1, 1])
