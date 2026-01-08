@@ -10,6 +10,8 @@ pip install -r requirements.txt  # nếu đã có danh sách phụ thuộc
 pip install streamlit pandas numpy scikit-learn pyarrow
 
 streamlit run streamlit_app.py
+
+python -m streamlit run streamlit_app.py --server.headless true --server.port 8501 
 ```
 
 Ứng dụng sẽ tải dữ liệu `cars.csv` (hoặc file CSV bạn upload), huấn luyện RandomForest, tính AHP (ma trận, trọng số, λ_max, CI, CR) và hiển thị bảng xếp hạng đề xuất theo thời gian thực.
