@@ -17,6 +17,9 @@ Hoặc chạy trực tiếp bằng Python trong `.venv`:
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m streamlit run streamlit_app.py --server.port 8501
 ```
+TK
+admin/admin123
+a/123456
 
 Ứng dụng hiện dùng **PostgreSQL** làm nguồn dữ liệu (thay cho `cars.csv`), có đăng nhập với 2 role:
 
