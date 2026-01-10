@@ -50,6 +50,21 @@ def get_engine():
     return engine
 
 
+@st.cache_data(show_spinner=False)
+def load_vehicle_dataframe() -> pd.DataFrame:
+    """Load and normalize the cars table once per session."""
+
+    engine = get_engine()
+    df_raw = read_cars_df(engine)
+    return normalize_vehicle_dataframe(df_raw)
+
+
+def refresh_vehicle_cache() -> None:
+    """Clear cached vehicle data after imports/add/delete."""
+
+    load_vehicle_dataframe.clear()
+
+
 def current_user() -> dict | None:
     return st.session_state.get("user")
 
@@ -106,8 +121,7 @@ def page_recommend(engine) -> None:
     st.header("Gợi ý xe")
     st.caption("Kết quả chỉ được tính khi bạn nhấn nút 'Tìm xe phù hợp'.")
 
-    df_raw = read_cars_df(engine)
-    df_raw = normalize_vehicle_dataframe(df_raw)
+    df_raw = load_vehicle_dataframe()
     if df_raw.empty:
         st.warning("Chưa có dữ liệu xe trong CSDL. Admin hãy vào trang 'Thêm dữ liệu' để nhập.")
         return
@@ -289,7 +303,7 @@ def page_recommend(engine) -> None:
         weights_raw, _, _, CR = compute_ahp_weights(pairwise)
         ahp_weights = dict(zip(ahp_criteria, weights_raw))
 
-        artifacts = train_ai_model(df)
+        artifacts = train_ai_model(df, data_key)
 
         df_scored = df_filtered.copy()
         df_scored["ahp_score"] = compute_ahp_score(
@@ -601,6 +615,7 @@ def page_admin_add_data(engine) -> None:
             if st.button("Import vào CSDL", width="stretch"):
                 with st.spinner("Đang import..."):
                     inserted, skipped = bulk_insert_cars_from_dataframe(engine, df_csv, skip_duplicates=skip_dups)
+                refresh_vehicle_cache()
                 st.success(f"Import xong. Thêm mới: {inserted:,} · Bỏ qua trùng: {skipped:,}")
                 st.rerun()
         except Exception as exc:
@@ -640,20 +655,25 @@ def page_admin_add_data(engine) -> None:
                     "price_drop": float(price_drop),
                 },
             )
+            refresh_vehicle_cache()
             st.success("Đã thêm xe")
 
     st.subheader("Danh sách xe")
-    df = read_cars_df(engine)
+    df = load_vehicle_dataframe()
     if df.empty:
         st.caption("Chưa có xe")
         return
-    st.dataframe(df, width="stretch", hide_index=True)
+    preview = df.head(1000)
+    st.dataframe(preview, width="stretch", hide_index=True)
+    if len(df) > len(preview):
+        st.caption(f"Đang hiển thị {len(preview):,}/{len(df):,} dòng (để tránh lag).")
 
     car_id = st.number_input("ID xe cần xoá", min_value=0, value=0, step=1)
     if st.button("Xoá xe", type="secondary"):
         if int(car_id) > 0:
             delete_car(engine, int(car_id))
             st.success("Đã xoá")
+            refresh_vehicle_cache()
             st.rerun()
 
 

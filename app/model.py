@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha1
 
 import pandas as pd
 import streamlit as st
@@ -18,14 +17,16 @@ class ModelArtifacts:
     feature_importance: pd.DataFrame
 
 
-def _hash_dataframe(df: pd.DataFrame) -> str:
-    hashed = pd.util.hash_pandas_object(df, index=True).values
-    return sha1(hashed.tobytes()).hexdigest()
+MAX_TRAIN_ROWS = 6000
 
 
-@st.cache_resource(show_spinner=False, hash_funcs={pd.DataFrame: _hash_dataframe})
-def train_ai_model(df: pd.DataFrame) -> ModelArtifacts:
+@st.cache_resource(show_spinner=False, hash_funcs={pd.DataFrame: lambda _: 0})
+def train_ai_model(df: pd.DataFrame, data_signature: str) -> ModelArtifacts:
+    _ = data_signature  # cache-busting key tied to the underlying dataset
     df_ml = df.copy()
+
+    if len(df_ml) > MAX_TRAIN_ROWS:
+        df_ml = df_ml.sample(MAX_TRAIN_ROWS, random_state=42).reset_index(drop=True)
 
     cat_cols = df_ml.select_dtypes(include="string").columns
     for col in cat_cols:
