@@ -5,51 +5,146 @@ import pandas as pd
 import streamlit as st
 
 from app.ahp import compute_ahp_score, compute_ahp_weights
+from app.auth import verify_password
 from app.constants import (
-    AHP_CRITERIA,
-    CRITERIA_LABELS,
-    DATA_DEFAULT_PATH,
     DEFAULT_SCORES,
     DISPLAY_COLUMN_LABELS,
     PRESET_SCORES,
     RISK_TEXT,
 )
-from app.data import add_risk_label, apply_filters, dataset_signature, load_data_from_path
+from app.data import add_risk_label, dataset_signature, normalize_vehicle_dataframe, load_data_from_bytes
+from app.db import (
+    bulk_insert_cars_from_dataframe,
+    create_criterion,
+    create_db_engine,
+    delete_car,
+    delete_criterion,
+    delete_user,
+    get_user_by_id,
+    get_user_by_username,
+    healthcheck,
+    init_db,
+    insert_car,
+    list_criteria,
+    list_recommendations,
+    list_users,
+    read_cars_df,
+    save_recommendation,
+    update_user,
+    update_criterion,
+    count_rows,
+    create_user,
+)
 from app.maintenance import predict_maintenance_cost, train_maintenance_model
 from app.model import train_ai_model
 from app.reliability import predict_major_repair_risk, train_reliability_model
+from app.seed import ensure_seed
+from app.auth import hash_password
 
 
-def main() -> None:
-    st.set_page_config(page_title="Hệ thống hỗ trợ mua ô tô cũ", layout="wide")
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    engine = create_db_engine()
+    init_db(engine)
+    ensure_seed(engine)
+    return engine
 
-    st.title("Hệ thống hỗ trợ mua ô tô cũ (AHP + AI)")
-    st.caption("Trả lời nhanh nhu cầu của bạn, hệ thống sẽ phân tích dữ liệu xe cũ có sẵn và đề xuất danh sách phù hợp.")
 
-    if not DATA_DEFAULT_PATH.exists():
-        st.error("Không tìm thấy cars.csv trong thư mục dự án")
-        st.stop()
+def current_user() -> dict | None:
+    return st.session_state.get("user")
 
-    df_raw = load_data_from_path(str(DATA_DEFAULT_PATH))
+
+def is_admin() -> bool:
+    user = current_user()
+    return bool(user and user.get("role") == "admin")
+
+
+def sidebar_auth(engine) -> None:
+    sidebar = st.sidebar
+    sidebar.subheader("Tài khoản")
+    sidebar.caption("Khách vẫn dùng bình thường; đăng nhập để có thêm chức năng.")
+
+    user = current_user()
+    if user:
+        sidebar.success(f"Đang đăng nhập: {user['username']} ({user['role']})")
+        if sidebar.button("Đăng xuất", width="stretch"):
+            st.session_state.pop("user", None)
+            st.rerun()
+        return
+
+    username = sidebar.text_input("Tên đăng nhập", key="login_username")
+    password = sidebar.text_input("Mật khẩu", type="password", key="login_password")
+    if sidebar.button("Đăng nhập", width="stretch"):
+        u = get_user_by_username(engine, username.strip()) if username else None
+        if u is None or not verify_password(password, u.password_hash):
+            sidebar.error("Sai tài khoản hoặc mật khẩu")
+            return
+        st.session_state.user = {"id": u.id, "username": u.username, "role": u.role}
+        st.rerun()
+
+
+def apply_filter_criteria(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    out = df
+    for f in filters:
+        key = f["key"]
+        value = f["value"]
+        if key not in out.columns:
+            continue
+
+        if value is None:
+            continue
+
+        if isinstance(value, tuple) and len(value) == 2:
+            lo, hi = value
+            out = out[(out[key] >= lo) & (out[key] <= hi)]
+        elif isinstance(value, str) and value != "(All)":
+            out = out[out[key].astype("string") == value]
+    return out.copy()
+
+
+def page_recommend(engine) -> None:
+    st.header("Gợi ý xe")
+    st.caption("Kết quả chỉ được tính khi bạn nhấn nút 'Tìm xe phù hợp'.")
+
+    df_raw = read_cars_df(engine)
+    df_raw = normalize_vehicle_dataframe(df_raw)
+    if df_raw.empty:
+        st.warning("Chưa có dữ liệu xe trong CSDL. Admin hãy vào trang 'Thêm dữ liệu' để nhập.")
+        return
+
     df = add_risk_label(df_raw)
     data_key = dataset_signature(df)
+
+    ahp_criteria_rows = list_criteria(engine, kind="ahp", enabled_only=True)
+    filter_rows = list_criteria(engine, kind="filter", enabled_only=True)
+
+    ahp_criteria = [c.key for c in ahp_criteria_rows]
+    labels = {c.key: c.label for c in ahp_criteria_rows + filter_rows}
+    benefit_criteria = [c.key for c in ahp_criteria_rows if c.direction == "benefit"]
+    cost_criteria = [c.key for c in ahp_criteria_rows if c.direction == "cost"]
+
+    if not ahp_criteria:
+        st.error("Chưa cấu hình tiêu chí AHP. Admin hãy thêm tiêu chí ở trang 'Tiêu chí'.")
+        return
 
     if "selected_preset" not in st.session_state:
         st.session_state.selected_preset = next(iter(PRESET_SCORES.keys()))
 
     if "criteria_initialized" not in st.session_state:
-        for criterion in AHP_CRITERIA:
+        for criterion in ahp_criteria:
             st.session_state[f"criteria_{criterion}"] = int(DEFAULT_SCORES.get(criterion, 5))
         st.session_state.criteria_initialized = True
 
     def _apply_preset_to_sliders() -> None:
         preset_name = st.session_state.get("selected_preset")
         preset_values = PRESET_SCORES.get(preset_name, DEFAULT_SCORES)
-        for criterion, value in preset_values.items():
-            st.session_state[f"criteria_{criterion}"] = int(value)
+        for criterion in ahp_criteria:
+            if criterion in preset_values:
+                st.session_state[f"criteria_{criterion}"] = int(preset_values[criterion])
 
     sidebar = st.sidebar
     sidebar.header("1. Mục tiêu sử dụng")
+    sidebar.caption("Chọn nhu cầu để tự gợi ý trọng số (bạn vẫn có thể chỉnh lại).")
     preset_options = list(PRESET_SCORES.keys())
     sidebar.radio(
         "Bạn đang tìm chiếc xe cũ kiểu nào?",
@@ -59,161 +154,151 @@ def main() -> None:
         on_change=_apply_preset_to_sliders,
     )
 
-    sidebar.caption("Hệ thống tự áp dụng trọng số ngay khi bạn chọn phong cách; vẫn có thể tinh chỉnh thủ công ở bước 3.")
+    with sidebar.form("search_form"):
+        st.subheader("2 · Điều kiện thực tế")
+        st.caption("Điều kiện lọc xe. (Admin có thể chỉnh danh sách bộ lọc ở trang 'Tiêu chí'.)")
 
-    maintenance_focus = False
-    maintenance_threshold = None
+        filter_inputs: list[dict] = []
+        for row in filter_rows:
+            key = row.key
+            if key not in df.columns:
+                continue
 
-    sidebar.subheader("2 · Điều kiện thực tế")
-    sidebar.caption("Điền ngân sách, năm sản xuất và thông số cơ bản bạn mong muốn.")
+            label = labels.get(key, key)
+            if pd.api.types.is_numeric_dtype(df[key]):
+                series = pd.to_numeric(df[key], errors="coerce").fillna(0)
+                lo = float(series.min())
+                hi = float(series.quantile(0.99)) if len(series) else float(series.max())
+                if hi < lo:
+                    hi = lo
+                # Use integer sliders for common integer-like fields
+                if key == "year":
+                    lo_i = int(lo)
+                    hi_i = int(hi)
+                    value = st.slider(
+                        f"{label}",
+                        min_value=lo_i,
+                        max_value=hi_i,
+                        value=(lo_i, hi_i),
+                        key=f"filter_{key}",
+                    )
+                    filter_inputs.append({"key": key, "value": value})
+                else:
+                    value = st.slider(
+                        f"{label}",
+                        min_value=float(lo),
+                        max_value=float(hi),
+                        value=(float(lo), float(hi)),
+                        key=f"filter_{key}",
+                    )
+                    filter_inputs.append({"key": key, "value": value})
+            else:
+                options = ["(All)"] + sorted(df[key].astype("string").unique().tolist())
+                value = st.selectbox(label, options, key=f"filter_{key}")
+                filter_inputs.append({"key": key, "value": value})
 
-    manufacturer_values = ["(All)"]
-    if "manufacturer" in df.columns:
-        manufacturer_values += sorted(df["manufacturer"].astype("string").unique().tolist())
-    manufacturer = sidebar.selectbox("Hãng xe", manufacturer_values)
-
-    if "year" in df.columns and len(df):
-        y_min, y_max = int(df["year"].min()), int(df["year"].max())
-    else:
-        y_min, y_max = 1990, 2026
-    year_range = sidebar.slider(
-        "Khoảng năm sản xuất",
-        min_value=y_min,
-        max_value=y_max,
-        value=(y_min, y_max),
-        format="%d",
-    )
-
-    if "price" in df.columns and len(df):
-        p_min = float(df["price"].min())
-        p_max = float(df["price"].quantile(0.99))
-    else:
-        p_min, p_max = 0.0, 100000.0
-    price_range = sidebar.slider(
-        "Khoảng giá (USD)",
-        min_value=float(p_min),
-        max_value=float(p_max),
-        value=(float(p_min), float(p_max)),
-        format="$%.0f",
-    )
-
-    if "mileage" in df.columns and len(df):
-        m_max_default = float(df["mileage"].quantile(0.99))
-    else:
-        m_max_default = 200000.0
-    max_mileage = sidebar.slider(
-        "Số dặm tối đa (mile)",
-        min_value=0.0,
-        max_value=float(max(m_max_default, 1.0)),
-        value=float(m_max_default),
-        format="%.0f mi",
-    )
-
-    sidebar.subheader("3 · Tuỳ chọn AI nâng cao")
-    maintenance_focus = sidebar.checkbox(
-        "Quan tâm chi phí bảo dưỡng (AI dự đoán)",
-        help="Bật để chỉ giữ những xe có chi phí bảo dưỡng ước tính thấp hơn ngưỡng bạn chọn.",
-        key="maintenance_focus",
-    )
-    maintenance_threshold = sidebar.slider(
-        "Ngưỡng chi phí tối đa (USD/năm)",
-        min_value=300,
-        max_value=4000,
-        value=int(st.session_state.get("maintenance_threshold", 1200)),
-        step=50,
-        disabled=not maintenance_focus,
-        key="maintenance_threshold",
-    )
-
-    repair_filter = sidebar.checkbox(
-        "Ẩn xe có nguy cơ sửa chữa lớn (AI)",
-        help="AI dự đoán xác suất phải sửa chữa lớn trong 12 tháng tới.",
-        key="repair_filter",
-    )
-    repair_threshold = sidebar.slider(
-        "Ngưỡng rủi ro sửa chữa (%)",
-        min_value=5,
-        max_value=80,
-        value=int(st.session_state.get("repair_threshold", 30)),
-        step=5,
-        format="%d%%",
-        disabled=not repair_filter,
-        key="repair_threshold",
-    )
-
-    sidebar.subheader("4 · Điều gì quan trọng với bạn?")
-    sidebar.caption("Các trọng số đã được điều chỉnh nhờ preset, bạn vẫn có thể kéo lại từng tiêu chí.")
-
-    criteria_scores: dict[str, int] = {}
-    for criterion in AHP_CRITERIA:
-        label = CRITERIA_LABELS.get(criterion, criterion.replace("_", " ").title())
-        slider_key = f"criteria_{criterion}"
-        default_value = int(st.session_state.get(slider_key, DEFAULT_SCORES.get(criterion, 5)))
-        criteria_scores[criterion] = int(
-            sidebar.slider(
-                f"{label} (1–9)",
-                min_value=1,
-                max_value=9,
-                value=default_value,
-                step=1,
-                key=slider_key,
-            )
+        st.subheader("3 · Tuỳ chọn AI nâng cao")
+        st.caption("Bật/tắt các gợi ý AI nâng cao nếu bạn quan tâm.")
+        maintenance_focus = st.checkbox(
+            "Quan tâm chi phí bảo dưỡng (AI dự đoán)",
+            help="Chỉ giữ xe có chi phí bảo dưỡng dự đoán thấp hơn ngưỡng.",
+            key="maintenance_focus",
+        )
+        maintenance_threshold = st.slider(
+            "Ngưỡng chi phí tối đa (USD/năm)",
+            min_value=300,
+            max_value=4000,
+            value=int(st.session_state.get("maintenance_threshold", 1200)),
+            step=50,
+            disabled=not maintenance_focus,
+            key="maintenance_threshold",
         )
 
-    sidebar.subheader("5 · Hiển thị gợi ý")
-    sidebar.caption("Chọn bạn muốn xem bao nhiêu xe và mức sàng lọc khắt khe tới đâu.")
-    top_percent = sidebar.slider(
-        "Chỉ giữ lại nhóm xe phù hợp nhất (%)",
-        min_value=10,
-        max_value=50,
-        value=int(st.session_state.get("top_percent", 30)),
-        step=5,
-        help="Ví dụ 30% nghĩa là chỉ giữ nhóm xe có điểm phù hợp cao nhất 30%.",
-        key="top_percent",
-    )
-    q = 1.0 - (float(top_percent) / 100.0)
-    top_n = sidebar.number_input(
-        "Muốn xem tối đa bao nhiêu xe?",
-        min_value=5,
-        max_value=50,
-        value=int(st.session_state.get("top_n", 10)),
-        step=1,
-        key="top_n",
-    )
+        repair_filter = st.checkbox(
+            "Ẩn xe có nguy cơ sửa chữa lớn (AI)",
+            help="Ẩn xe có rủi ro sửa chữa lớn vượt ngưỡng bạn chọn.",
+            key="repair_filter",
+        )
+        repair_threshold = st.slider(
+            "Ngưỡng rủi ro sửa chữa (%)",
+            min_value=5,
+            max_value=80,
+            value=int(st.session_state.get("repair_threshold", 30)),
+            step=5,
+            format="%d%%",
+            disabled=not repair_filter,
+            key="repair_threshold",
+        )
 
-    submitted = sidebar.button("Tìm xe phù hợp", use_container_width=True)
+        st.subheader("4 · Điều gì quan trọng với bạn?")
+        st.caption("Chấm điểm mức ưu tiên cho từng tiêu chí (1–9).")
 
+        criteria_scores: dict[str, int] = {}
+        for criterion in ahp_criteria:
+            label = labels.get(criterion, criterion.replace("_", " ").title())
+            slider_key = f"criteria_{criterion}"
+            default_value = int(st.session_state.get(slider_key, DEFAULT_SCORES.get(criterion, 5)))
+            criteria_scores[criterion] = int(
+                st.slider(
+                    f"{label} (1–9)",
+                    min_value=1,
+                    max_value=9,
+                    value=default_value,
+                    step=1,
+                    key=slider_key,
+                )
+            )
+
+        st.subheader("5 · Hiển thị gợi ý")
+        st.caption("Chọn số lượng kết quả và mức lọc "
+                   "khắt khe (giữ lại top % điểm phù hợp).")
+        top_percent = st.slider(
+            "Chỉ giữ lại nhóm xe phù hợp nhất (%)",
+            min_value=10,
+            max_value=50,
+            value=int(st.session_state.get("top_percent", 30)),
+            step=5,
+            key="top_percent",
+        )
+        q = 1.0 - (float(top_percent) / 100.0)
+        top_n = st.number_input(
+            "Muốn xem tối đa bao nhiêu xe?",
+            min_value=5,
+            max_value=50,
+            value=int(st.session_state.get("top_n", 10)),
+            step=1,
+            key="top_n",
+        )
+
+        submitted = st.form_submit_button("Tìm xe phù hợp")
     if not submitted:
-        st.info("Hoàn tất các bước ở thanh bên rồi nhấn 'Tìm xe phù hợp' để nhận gợi ý cá nhân hoá.")
+        st.info("Điền bộ lọc ở thanh bên và nhấn 'Tìm xe phù hợp'.")
         st.subheader("Xem nhanh dữ liệu")
-        st.dataframe(df.head(20), use_container_width=True)
+        st.dataframe(df.head(20), width="stretch")
         return
 
     with st.spinner("Đang tính toán điểm phù hợp và rủi ro..."):
-        df_filtered = apply_filters(df, manufacturer, year_range, price_range, max_mileage)
-
+        df_filtered = apply_filter_criteria(df, filter_inputs)
         if df_filtered.empty:
             st.warning("Không có xe nào thỏa bộ lọc hiện tại. Hãy nới lỏng điều kiện và thử lại.")
-            st.stop()
+            return
 
-        scores_vec = np.array([float(criteria_scores[c]) for c in AHP_CRITERIA], dtype=float)
-        if np.all(scores_vec > 0):
-            pairwise = scores_vec[:, None] / scores_vec[None, :]
-        else:
-            pairwise = np.ones((len(AHP_CRITERIA), len(AHP_CRITERIA)), dtype=float)
+        scores_vec = np.array([float(criteria_scores[c]) for c in ahp_criteria], dtype=float)
+        pairwise = scores_vec[:, None] / scores_vec[None, :] if np.all(scores_vec > 0) else np.ones((len(ahp_criteria), len(ahp_criteria)), dtype=float)
 
         weights_raw, _, _, CR = compute_ahp_weights(pairwise)
-        ahp_weights = dict(zip(AHP_CRITERIA, weights_raw))
+        ahp_weights = dict(zip(ahp_criteria, weights_raw))
 
-        try:
-            artifacts = train_ai_model(df)
-        except Exception as exc:
-            st.error(str(exc))
-            st.stop()
+        artifacts = train_ai_model(df)
 
         df_scored = df_filtered.copy()
-        df_scored["ahp_score"] = compute_ahp_score(df_scored, AHP_CRITERIA, ahp_weights)
-
+        df_scored["ahp_score"] = compute_ahp_score(
+            df_scored,
+            ahp_criteria,
+            ahp_weights,
+            benefit_criteria=benefit_criteria,
+            cost_criteria=cost_criteria,
+        )
         df_scored["risk_pred"] = artifacts.model.predict(df_scored[artifacts.features_ai])
 
         maintenance_note = ""
@@ -228,7 +313,7 @@ def main() -> None:
                 maintenance_note += f" Đã loại {removed} xe vượt ngưỡng."
             if df_scored.empty:
                 st.warning("Không có xe nào đáp ứng ngưỡng chi phí bảo dưỡng hiện tại. Hãy tăng giới hạn và thử lại.")
-                st.stop()
+                return
         else:
             df_scored["maintenance_cost_pred"] = np.nan
 
@@ -246,7 +331,7 @@ def main() -> None:
                 repair_note += f" Đã loại {removed} xe vượt ngưỡng."
             if df_scored.empty:
                 st.warning("Không còn xe nào sau khi áp dụng ngưỡng rủi ro sửa chữa. Hãy tăng giới hạn và thử lại.")
-                st.stop()
+                return
         else:
             df_scored["repair_risk_pred"] = np.nan
 
@@ -279,8 +364,8 @@ def main() -> None:
         st.caption(maintenance_note)
     if repair_note:
         st.caption(repair_note)
-    df_scored["risk_level"] = df_scored["risk_pred"].map(RISK_TEXT).fillna("Không rõ")
 
+    df_scored["risk_level"] = df_scored["risk_pred"].map(RISK_TEXT).fillna("Không rõ")
     show_maintenance_col = bool(maintenance_focus and "maintenance_cost_pred" in df_scored.columns)
     show_repair_col = bool(repair_filter and "repair_risk_pred" in df_scored.columns)
 
@@ -304,6 +389,8 @@ def main() -> None:
         "risk_level",
         "recommendation",
     ]
+    if "id" in df_scored.columns:
+        base_cols.insert(1, "id")
 
     show_cols = [c for c in base_cols if c in df_scored.columns]
     if show_maintenance_col:
@@ -318,74 +405,381 @@ def main() -> None:
     )
 
     tab_top, tab_all = st.tabs(["Top đề xuất", "Danh sách sau chấm điểm"])
-    column_config = {
-        "price": st.column_config.NumberColumn("Giá (USD)", help="Giá niêm yết", format="$%0.0f"),
-        "mileage": st.column_config.NumberColumn("Số dặm", format="%0.0f mi"),
-        "mpg": st.column_config.TextColumn("Tiết kiệm nhiên liệu"),
-        "fuel_type": st.column_config.TextColumn("Loại nhiên liệu"),
-        "engine": st.column_config.TextColumn("Động cơ"),
-        "accidents_or_damage": st.column_config.NumberColumn("Tai nạn/Hư hại", format="%0.0f"),
-        "one_owner": st.column_config.NumberColumn("Số chủ sở hữu", format="%0.0f"),
-        "driver_rating": st.column_config.NumberColumn("Điểm người lái", format="%0.1f"),
-        "seller_rating": st.column_config.NumberColumn("Điểm người bán", format="%0.1f"),
-        "price_drop": st.column_config.NumberColumn("Giảm giá (%)", format="%0.1f%%"),
-        "ahp_score": st.column_config.NumberColumn("Điểm phù hợp", format="%0.2f"),
-        "risk_pred": st.column_config.NumberColumn("Rủi ro (AI)", help="0 = Thấp, 1 = Cao"),
-        "risk_level": st.column_config.TextColumn("Đánh giá rủi ro"),
-        "maintenance_cost_pred": st.column_config.NumberColumn(
-            "Ước tính bảo dưỡng (USD/năm)",
-            format="$%0.0f",
-            help="AI ước lượng chi phí bảo dưỡng mỗi năm",
-        ),
-        "repair_risk_pred": st.column_config.NumberColumn(
-            "Nguy cơ sửa chữa (%)",
-            format="%0.0f%%",
-            help="Xác suất phải sửa chữa lớn trong 12 tháng",
-        ),
-    }
-
     with tab_top:
-        st.caption("Những xe điểm phù hợp cao và bị AI đánh giá rủi ro thấp.")
         if len(df_top):
             st.dataframe(
                 df_top[show_cols].rename(columns=DISPLAY_COLUMN_LABELS),
-                use_container_width=True,
-                column_config=column_config,
+                width="stretch",
                 hide_index=True,
             )
         else:
             st.info("Không có xe nào đạt tới nhóm điểm bạn đã chọn.")
     with tab_all:
-        st.caption("Toàn bộ xe sau lọc, kèm điểm phù hợp và dự đoán rủi ro.")
         st.dataframe(
             df_scored[show_cols].rename(columns=DISPLAY_COLUMN_LABELS),
-            use_container_width=True,
-            column_config=column_config,
+            width="stretch",
             hide_index=True,
         )
 
-    csv_out = df_scored.to_csv(index=False).encode("utf-8")
-    st.download_button("Tải danh sách đầy đủ (CSV)", data=csv_out, file_name="dss_result.csv", mime="text/csv")
+    # Save history for logged-in users
+    user = current_user()
+    if user:
+        inputs_payload = {
+            "filters": filter_inputs,
+            "criteria_scores": criteria_scores,
+            "maintenance_focus": bool(maintenance_focus),
+            "maintenance_threshold": int(maintenance_threshold),
+            "repair_filter": bool(repair_filter),
+            "repair_threshold": int(repair_threshold),
+            "top_percent": int(top_percent),
+            "top_n": int(top_n),
+        }
+        results_payload = {
+            "top": df_top[show_cols].to_dict(orient="records"),
+            "counts": {
+                "after_filter": int(total_after_filter),
+                "recommended": int(recommended_count),
+                "cr": float(CR),
+            },
+        }
+        save_recommendation(engine, int(user["id"]), inputs=inputs_payload, results=results_payload)
 
-    st.subheader("Phân tích chi tiết")
-    col_ai, col_ahp = st.columns(2)
 
-    with col_ai:
-        st.write("Mô hình RandomForest AI dự đoán khả năng rủi ro của từng xe.")
-        st.metric("Độ chính xác trên tập kiểm thử", f"{artifacts.accuracy:.3f}")
-        st.write("Tầm quan trọng của từng thuộc tính")
-        st.bar_chart(artifacts.feature_importance.set_index("feature")["importance"])
+def page_history(engine) -> None:
+    user = current_user()
+    if not user:
+        st.info("Bạn cần đăng nhập để xem lịch sử đề xuất.")
+        return
 
-    with col_ahp:
-        st.write("Các tiêu chí được bạn ưu tiên nhiều nhất")
-        top_weights = pd.Series(ahp_weights).sort_values(ascending=False).head(3)
-        if not top_weights.empty:
-            bullet_lines = [
-                f"- **{CRITERIA_LABELS.get(name, name)}** · {weight:.1%}"
-                for name, weight in top_weights.items()
+    st.header("Lịch sử đề xuất")
+    recs = list_recommendations(engine, int(user["id"]), limit=50)
+    if not recs:
+        st.caption("Chưa có lịch sử. Hãy chạy 'Gợi ý xe' để lưu lại.")
+        return
+
+    rows = [
+        {
+            "id": r.id,
+            "created_at": str(r.created_at),
+            "after_filter": r.results.get("counts", {}).get("after_filter"),
+            "recommended": r.results.get("counts", {}).get("recommended"),
+            "cr": r.results.get("counts", {}).get("cr"),
+        }
+        for r in recs
+    ]
+    df_hist = pd.DataFrame(rows)
+    st.dataframe(df_hist, width="stretch", hide_index=True)
+
+    pick = st.selectbox("Xem chi tiết lần chạy", options=[r.id for r in recs], format_func=lambda x: f"#{x}")
+    selected = next((r for r in recs if r.id == pick), None)
+    if selected:
+        top = selected.results.get("top", [])
+        st.subheader("Top kết quả đã lưu")
+        if top:
+            st.dataframe(pd.DataFrame(top), width="stretch", hide_index=True)
+        else:
+            st.caption("Không có dữ liệu top đã lưu.")
+
+
+def page_admin_dashboard(engine) -> None:
+    st.header("Admin · Dashboard")
+    counts = count_rows(engine)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Users", counts["users"])
+    c2.metric("Cars", counts["cars"])
+    c3.metric("Recommendations", counts["recommendations"])
+
+    st.subheader("Tạo tài khoản")
+    with st.form("create_user"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        role = st.selectbox("Role", ["user", "admin"])
+        submitted = st.form_submit_button("Tạo")
+        if submitted:
+            if not username or not password:
+                st.error("Cần nhập username và password")
+            elif get_user_by_username(engine, username) is not None:
+                st.error("Username đã tồn tại")
+            else:
+                create_user(engine, username, hash_password(password), role=role)
+                st.success("Đã tạo tài khoản")
+
+
+def page_admin_users(engine) -> None:
+    st.header("Admin · Quản lý người dùng")
+    st.caption("Tạo/sửa/xoá tài khoản. Lưu ý: không nên xoá tài khoản đang đăng nhập.")
+
+    users = list_users(engine, limit=500)
+    if users:
+        df_users = pd.DataFrame(
+            [
+                {
+                    "id": u.id,
+                    "username": u.username,
+                    "role": u.role,
+                    "created_at": str(u.created_at),
+                }
+                for u in users
             ]
-            st.markdown("\n".join(bullet_lines))
-        st.caption("Điểm phù hợp (AHP) được chuẩn hóa 0–1 và kết hợp với dự đoán rủi ro để đưa ra đề xuất.")
+        )
+        st.dataframe(df_users, width="stretch", hide_index=True)
+    else:
+        st.caption("Chưa có người dùng")
+
+    st.subheader("Tạo người dùng")
+    with st.form("admin_create_user"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        role = st.selectbox("Role", ["user", "admin"])
+        submitted = st.form_submit_button("Tạo")
+        if submitted:
+            if not username or not password:
+                st.error("Cần nhập username và password")
+            elif get_user_by_username(engine, username) is not None:
+                st.error("Username đã tồn tại")
+            else:
+                create_user(engine, username, hash_password(password), role=role)
+                st.success("Đã tạo")
+                st.rerun()
+
+    st.subheader("Cập nhật / Xoá")
+    uid = st.number_input("User ID", min_value=0, value=0, step=1)
+    uobj = get_user_by_id(engine, int(uid)) if int(uid) > 0 else None
+    if uobj is not None:
+        st.caption(f"Đang chọn: {uobj.username} ({uobj.role})")
+    col1, col2 = st.columns(2)
+    with col1:
+        new_username = st.text_input("Username mới (bỏ trống nếu không đổi)", value="")
+        new_role = st.selectbox("Role mới", ["(no change)", "user", "admin"])
+        new_password = st.text_input("Mật khẩu mới (bỏ trống nếu không đổi)", type="password")
+        if st.button("Cập nhật"):
+            if int(uid) <= 0:
+                st.error("Nhập User ID")
+            else:
+                try:
+                    update_user(
+                        engine,
+                        int(uid),
+                        username=new_username or None,
+                        role=None if new_role == "(no change)" else new_role,
+                        password_hash=None if not new_password else hash_password(new_password),
+                    )
+                    st.success("Đã cập nhật")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+    with col2:
+        if st.button("Xoá", type="secondary"):
+            cu = current_user()
+            if int(uid) <= 0:
+                st.error("Nhập User ID")
+            elif cu and int(uid) == int(cu.get("id")):
+                st.error("Không thể xoá tài khoản đang đăng nhập")
+            else:
+                try:
+                    delete_user(engine, int(uid))
+                    st.success("Đã xoá")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+
+def page_admin_add_data(engine) -> None:
+    st.header("Admin · Thêm dữ liệu")
+    st.caption("Nhập xe vào CSDL (thay cho cars.csv).")
+
+    st.subheader("Import từ CSV")
+    csv_file = st.file_uploader("Chọn file cars.csv", type=["csv"], accept_multiple_files=False)
+    skip_dups = st.checkbox("Bỏ qua dữ liệu trùng", value=True)
+    if csv_file is not None:
+        try:
+            df_csv = load_data_from_bytes(csv_file.getvalue())
+            df_csv = normalize_vehicle_dataframe(df_csv)
+            st.caption(f"Đã đọc {len(df_csv):,} dòng từ CSV")
+            st.dataframe(df_csv.head(30), width="stretch", hide_index=True)
+
+            if st.button("Import vào CSDL", width="stretch"):
+                with st.spinner("Đang import..."):
+                    inserted, skipped = bulk_insert_cars_from_dataframe(engine, df_csv, skip_duplicates=skip_dups)
+                st.success(f"Import xong. Thêm mới: {inserted:,} · Bỏ qua trùng: {skipped:,}")
+                st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    with st.form("add_car"):
+        manufacturer = st.text_input("Hãng (manufacturer)", value="")
+        model = st.text_input("Mẫu xe (model)", value="")
+        year = st.number_input("Năm (year)", min_value=1950, max_value=2100, value=2018, step=1)
+        price = st.number_input("Giá (price)", min_value=0.0, value=15000.0, step=100.0)
+        mileage = st.number_input("Số dặm (mileage)", min_value=0.0, value=50000.0, step=500.0)
+        mpg = st.text_input("MPG (mpg)", value="")
+        fuel_type = st.text_input("Loại nhiên liệu (fuel_type)", value="")
+        engine_txt = st.text_input("Động cơ (engine)", value="")
+        accidents = st.number_input("Tai nạn/Hư hại (accidents_or_damage)", min_value=0.0, value=0.0, step=1.0)
+        one_owner = st.number_input("Số chủ (one_owner)", min_value=0.0, value=1.0, step=1.0)
+        driver_rating = st.number_input("Điểm người lái (driver_rating)", min_value=0.0, max_value=5.0, value=4.2, step=0.1)
+        seller_rating = st.number_input("Điểm người bán (seller_rating)", min_value=0.0, max_value=5.0, value=4.2, step=0.1)
+        price_drop = st.number_input("Giảm giá % (price_drop)", min_value=0.0, value=0.0, step=0.1)
+        submitted = st.form_submit_button("Thêm xe")
+        if submitted:
+            insert_car(
+                engine,
+                {
+                    "manufacturer": manufacturer or "Unknown",
+                    "model": model or "Unknown",
+                    "year": int(year),
+                    "price": float(price),
+                    "mileage": float(mileage),
+                    "mpg": mpg or "Unknown",
+                    "fuel_type": fuel_type or "Unknown",
+                    "engine": engine_txt or "Unknown",
+                    "accidents_or_damage": float(accidents),
+                    "one_owner": float(one_owner),
+                    "driver_rating": float(driver_rating),
+                    "seller_rating": float(seller_rating),
+                    "price_drop": float(price_drop),
+                },
+            )
+            st.success("Đã thêm xe")
+
+    st.subheader("Danh sách xe")
+    df = read_cars_df(engine)
+    if df.empty:
+        st.caption("Chưa có xe")
+        return
+    st.dataframe(df, width="stretch", hide_index=True)
+
+    car_id = st.number_input("ID xe cần xoá", min_value=0, value=0, step=1)
+    if st.button("Xoá xe", type="secondary"):
+        if int(car_id) > 0:
+            delete_car(engine, int(car_id))
+            st.success("Đã xoá")
+            st.rerun()
+
+
+def page_admin_criteria(engine) -> None:
+    st.header("Admin · Tiêu chí")
+    st.caption("Thêm/xoá và bật/tắt tiêu chí tính AHP và tiêu chí lọc.")
+
+    criteria = list_criteria(engine)
+    if criteria:
+        df = pd.DataFrame(
+            [
+                {
+                    "id": c.id,
+                    "key": c.key,
+                    "label": c.label,
+                    "kind": c.kind,
+                    "direction": c.direction,
+                    "enabled": c.enabled,
+                }
+                for c in criteria
+            ]
+        )
+        st.dataframe(df, width="stretch", hide_index=True)
+    else:
+        st.caption("Chưa có tiêu chí")
+
+    st.subheader("Thêm tiêu chí")
+    allowed_keys = [
+        "manufacturer",
+        "model",
+        "year",
+        "mileage",
+        "price",
+        "mpg",
+        "fuel_type",
+        "engine",
+        "accidents_or_damage",
+        "one_owner",
+        "driver_rating",
+        "seller_rating",
+        "price_drop",
+    ]
+    with st.form("add_criterion"):
+        key = st.selectbox("Cột (key)", allowed_keys)
+        label = st.text_input("Nhãn hiển thị (label)", value=key)
+        kind = st.selectbox("Loại (kind)", ["ahp", "filter"])
+        direction = st.selectbox("Hướng (direction)", ["benefit", "cost", "none"])
+        enabled = st.checkbox("Enabled", value=True)
+        submitted = st.form_submit_button("Thêm")
+        if submitted:
+            try:
+                create_criterion(engine, key=key, label=label, kind=kind, direction=direction, enabled=enabled)
+                st.success("Đã thêm tiêu chí")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    st.subheader("Cập nhật / Xoá")
+    cid = st.number_input("Criterion ID", min_value=0, value=0, step=1)
+    col1, col2 = st.columns(2)
+    with col1:
+        new_label = st.text_input("Label mới (bỏ trống nếu không đổi)", value="")
+        new_direction = st.selectbox("Direction", ["(no change)", "benefit", "cost", "none"])
+        new_enabled = st.selectbox("Enabled", ["(no change)", "true", "false"])
+        if st.button("Cập nhật"):
+            if int(cid) <= 0:
+                st.error("Nhập criterion id")
+            else:
+                update_criterion(
+                    engine,
+                    int(cid),
+                    label=new_label or None,
+                    direction=None if new_direction == "(no change)" else new_direction,
+                    enabled=None if new_enabled == "(no change)" else (new_enabled == "true"),
+                )
+                st.success("Đã cập nhật")
+                st.rerun()
+    with col2:
+        if st.button("Xoá", type="secondary"):
+            if int(cid) <= 0:
+                st.error("Nhập criterion id")
+            else:
+                delete_criterion(engine, int(cid))
+                st.success("Đã xoá")
+                st.rerun()
+
+
+def main() -> None:
+    st.set_page_config(page_title="Hệ thống hỗ trợ mua ô tô cũ", layout="wide")
+    st.title("Hệ thống hỗ trợ mua ô tô cũ (AHP + AI)")
+    st.caption("Dữ liệu lấy từ PostgreSQL. Khách vẫn dùng bình thường; user đăng nhập có lịch sử; admin có dashboard/quản trị.")
+
+    try:
+        engine = get_engine()
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+    ok, msg = healthcheck(engine)
+    if not ok:
+        st.error(f"Không kết nối được PostgreSQL: {msg}")
+        st.stop()
+
+    sidebar_auth(engine)
+
+    # Top navigation (horizontal)
+    pages = ["Gợi ý xe"]
+    if current_user():
+        pages.append("Lịch sử")
+    if is_admin():
+        pages.extend(["Dashboard", "Người dùng", "Thêm dữ liệu", "Tiêu chí"])
+
+    page = st.radio("Điều hướng", pages, horizontal=True, label_visibility="collapsed")
+    st.divider()
+    if page == "Gợi ý xe":
+        page_recommend(engine)
+    elif page == "Lịch sử":
+        page_history(engine)
+    elif page == "Dashboard":
+        page_admin_dashboard(engine)
+    elif page == "Người dùng":
+        page_admin_users(engine)
+    elif page == "Thêm dữ liệu":
+        page_admin_add_data(engine)
+    elif page == "Tiêu chí":
+        page_admin_criteria(engine)
 
 
 if __name__ == "__main__":
