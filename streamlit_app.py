@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from app.ahp import compute_ahp_score, compute_ahp_weights
+from app.ahp import compute_ahp_score, compute_ahp_weights, parse_mpg
 from app.auth import verify_password
 from app.constants import (
     DEFAULT_SCORES,
@@ -106,8 +106,9 @@ def page_recommend(engine) -> None:
     st.header("Gợi ý xe")
     st.caption("Kết quả chỉ được tính khi bạn nhấn nút 'Tìm xe phù hợp'.")
 
-    df_raw = read_cars_df(engine)
-    df_raw = normalize_vehicle_dataframe(df_raw)
+    with st.spinner("Đang tải dữ liệu xe..."):
+        df_raw = read_cars_df(engine)
+        df_raw = normalize_vehicle_dataframe(df_raw)
     if df_raw.empty:
         st.warning("Chưa có dữ liệu xe trong CSDL. Admin hãy vào trang 'Thêm dữ liệu' để nhập.")
         return
@@ -272,10 +273,20 @@ def page_recommend(engine) -> None:
 
         submitted = st.form_submit_button("Tìm xe phù hợp")
     if not submitted:
-        st.info("Điền bộ lọc ở thanh bên và nhấn 'Tìm xe phù hợp'.")
-        st.subheader("Xem nhanh dữ liệu")
-        st.dataframe(df.head(20), width="stretch")
-        return
+        cached = st.session_state.get("recommendation_cache")
+        if cached and cached.get("data_key") == data_key:
+            st.info("Đang hiển thị kết quả lần chạy gần nhất. Nhấn 'Tìm xe phù hợp' để tính lại nếu bạn thay đổi điều kiện.")
+            df_scored = cached["df_scored"].copy()
+            df_top = cached["df_top"].copy()
+            show_cols = list(cached["show_cols"])
+            CR = float(cached["cr"])
+            maintenance_note = str(cached.get("maintenance_note", ""))
+            repair_note = str(cached.get("repair_note", ""))
+        else:
+            st.info("Điền bộ lọc ở thanh bên và nhấn 'Tìm xe phù hợp'.")
+            st.subheader("Xem nhanh dữ liệu")
+            st.dataframe(df.head(20), width="stretch")
+            return
 
     with st.spinner("Đang tính toán điểm phù hợp và rủi ro..."):
         df_filtered = apply_filter_criteria(df, filter_inputs)
@@ -289,7 +300,7 @@ def page_recommend(engine) -> None:
         weights_raw, _, _, CR = compute_ahp_weights(pairwise)
         ahp_weights = dict(zip(ahp_criteria, weights_raw))
 
-        artifacts = train_ai_model(df)
+        artifacts = train_ai_model(df, data_key)
 
         df_scored = df_filtered.copy()
         df_scored["ahp_score"] = compute_ahp_score(
@@ -404,6 +415,17 @@ def page_recommend(engine) -> None:
         .head(int(top_n))
     )
 
+    # Persist results to avoid recomputation on widget reruns (e.g. comparison)
+    st.session_state["recommendation_cache"] = {
+        "data_key": data_key,
+        "df_scored": df_scored.copy(),
+        "df_top": df_top.copy(),
+        "show_cols": show_cols,
+        "cr": float(CR),
+        "maintenance_note": maintenance_note,
+        "repair_note": repair_note,
+    }
+
     tab_top, tab_all = st.tabs(["Top đề xuất", "Danh sách sau chấm điểm"])
     with tab_top:
         if len(df_top):
@@ -420,6 +442,166 @@ def page_recommend(engine) -> None:
             width="stretch",
             hide_index=True,
         )
+
+    st.subheader("So sánh xe")
+    st.caption("Chọn tối đa 4 xe và nhấn 'So sánh' để tạo bảng. Giá trị tốt hơn sẽ được tô xanh theo từng tiêu chí (benefit: cao hơn tốt hơn, cost: thấp hơn tốt hơn).")
+
+    df_candidates = df_top if len(df_top) else df_scored
+    if df_candidates.empty:
+        st.info("Chưa có danh sách xe để so sánh.")
+        return
+
+    df_candidates = df_candidates.copy()
+    key_col = "id" if "id" in df_candidates.columns else None
+    df_candidates["__car_key"] = df_candidates[key_col].astype(str) if key_col else df_candidates.index.astype(str)
+
+    def _car_label(row: pd.Series) -> str:
+        manufacturer = str(row.get("manufacturer", ""))
+        model = str(row.get("model", ""))
+        year = row.get("year", "")
+        price = row.get("price", None)
+        rank = row.get("rank", None)
+
+        parts: list[str] = []
+        if pd.notna(rank) and int(rank) > 0:
+            parts.append(f"#{int(rank)}")
+        title = " ".join([p for p in [manufacturer, model] if p and p != "Unknown"]).strip()
+        if title:
+            parts.append(title)
+        if pd.notna(year):
+            try:
+                parts.append(str(int(year)))
+            except Exception:
+                parts.append(str(year))
+        if pd.notna(price):
+            try:
+                parts.append(f"${float(price):,.0f}")
+            except Exception:
+                parts.append(str(price))
+
+        if key_col and pd.notna(row.get(key_col)):
+            parts.append(f"id={row.get(key_col)}")
+        return " · ".join([p for p in parts if p])
+
+    df_candidates["__car_label"] = df_candidates.apply(_car_label, axis=1)
+    label_to_key = dict(zip(df_candidates["__car_label"].tolist(), df_candidates["__car_key"].tolist()))
+
+    with st.form("compare_form"):
+        selected_labels = st.multiselect(
+            "Chọn xe để so sánh",
+            options=df_candidates["__car_label"].tolist(),
+            default=st.session_state.get("compare_selected_labels", df_candidates["__car_label"].tolist()[:2]),
+            max_selections=4,
+            help="Trong form này, thay đổi lựa chọn sẽ KHÔNG tự chạy lại; chỉ chạy khi bạn bấm 'So sánh'.",
+        )
+        run_compare = st.form_submit_button("So sánh")
+
+    st.session_state["compare_selected_labels"] = selected_labels
+    if not run_compare:
+        st.caption("Chọn xe và bấm 'So sánh' để tạo bảng (không tự chạy khi thêm/xoá lựa chọn).")
+    elif len(selected_labels) < 2:
+        st.info("Hãy chọn ít nhất 2 xe để bắt đầu so sánh.")
+    else:
+        with st.spinner("Đang tạo bảng so sánh..."):
+            selected_keys = [label_to_key[lbl] for lbl in selected_labels if lbl in label_to_key]
+            df_selected = df_candidates[df_candidates["__car_key"].isin(selected_keys)].copy()
+            df_selected["__car_label"] = df_selected.apply(_car_label, axis=1)
+            df_selected["__car_label"] = pd.Categorical(df_selected["__car_label"], categories=selected_labels, ordered=True)
+            df_selected = df_selected.sort_values("__car_label")
+
+            compare_fields = [
+            "manufacturer",
+            "model",
+            "year",
+            "price",
+            "mileage",
+            "mpg",
+            "fuel_type",
+            "engine",
+            "accidents_or_damage",
+            "one_owner",
+            "driver_rating",
+            "seller_rating",
+            "price_drop",
+            "maintenance_cost_pred",
+            "repair_risk_pred",
+            "ahp_score",
+            "rank",
+            "recommendation",
+            "risk_level",
+            ]
+            compare_fields = [c for c in compare_fields if c in df_selected.columns]
+
+            compare_df = pd.DataFrame(index=[DISPLAY_COLUMN_LABELS.get(c, c) for c in compare_fields])
+            for _, row in df_selected.iterrows():
+                col_name = str(row.get("__car_label"))
+                values: list[object] = []
+                for field in compare_fields:
+                    val = row.get(field)
+                    if field in {"price"} and pd.notna(val):
+                        try:
+                            values.append(f"${float(val):,.0f}")
+                        except Exception:
+                            values.append(val)
+                    elif field in {"mileage", "maintenance_cost_pred"} and pd.notna(val):
+                        try:
+                            values.append(f"{float(val):,.0f}")
+                        except Exception:
+                            values.append(val)
+                    elif field in {"repair_risk_pred", "price_drop"} and pd.notna(val):
+                        try:
+                            values.append(f"{float(val):.1f}%")
+                        except Exception:
+                            values.append(val)
+                    elif field in {"ahp_score"} and pd.notna(val):
+                        try:
+                            values.append(f"{float(val):.4f}")
+                        except Exception:
+                            values.append(val)
+                    else:
+                        values.append(val)
+                compare_df[col_name] = values
+
+            # Determine comparison directions per field
+            compare_direction: dict[str, str] = {}
+            for c in benefit_criteria:
+                compare_direction[c] = "benefit"
+            for c in cost_criteria:
+                compare_direction[c] = "cost"
+            # Heuristics for AI/derived metrics
+            compare_direction.setdefault("ahp_score", "benefit")
+            compare_direction.setdefault("rank", "cost")
+            compare_direction.setdefault("maintenance_cost_pred", "cost")
+            compare_direction.setdefault("repair_risk_pred", "cost")
+
+            def _numeric_series(field: str) -> pd.Series:
+                series = df_selected[field]
+                if field == "mpg":
+                    return series.apply(parse_mpg).astype(float)
+                return pd.to_numeric(series, errors="coerce")
+
+            def _highlight_best(data: pd.DataFrame) -> pd.DataFrame:
+                styles = pd.DataFrame("", index=data.index, columns=data.columns)
+                for field in compare_fields:
+                    direction = compare_direction.get(field)
+                    if direction not in {"benefit", "cost"}:
+                        continue
+                    try:
+                        numeric = _numeric_series(field)
+                    except Exception:
+                        continue
+                    numeric = numeric.replace([np.inf, -np.inf], np.nan)
+                    if numeric.notna().sum() == 0:
+                        continue
+                    best = float(numeric.max()) if direction == "benefit" else float(numeric.min())
+                    winners = numeric.eq(best)
+                    row_label = DISPLAY_COLUMN_LABELS.get(field, field)
+                    for is_winner, col in zip(winners.tolist(), df_selected["__car_label"].astype(str).tolist()):
+                        if is_winner and col in styles.columns and row_label in styles.index:
+                            styles.loc[row_label, col] = "color: #118D57; font-weight: 700;"
+                return styles
+
+            st.dataframe(compare_df.style.apply(_highlight_best, axis=None), width="stretch")
 
     # Save history for logged-in users
     user = current_user()
