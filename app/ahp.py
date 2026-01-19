@@ -63,7 +63,13 @@ def compute_ahp_weights(A: np.ndarray) -> tuple[np.ndarray, float, float, float]
     return weights, lambda_max, CI, CR
 
 
-def compute_ahp_score(df: pd.DataFrame, criteria: list[str], weights: dict[str, float]) -> pd.Series:
+def compute_ahp_score(
+    df: pd.DataFrame,
+    criteria: list[str],
+    weights: dict[str, float],
+    benefit_criteria: list[str] | None = None,
+    cost_criteria: list[str] | None = None,
+) -> pd.Series:
     df_work = df.copy()
     if "mpg" in df_work.columns:
         df_work["mpg"] = df_work["mpg"].apply(parse_mpg).astype(float)
@@ -75,13 +81,16 @@ def compute_ahp_score(df: pd.DataFrame, criteria: list[str], weights: dict[str, 
         else:
             df_ahp[col] = 0.0
 
-    for col in BENEFIT_CRITERIA:
+    benefit = benefit_criteria if benefit_criteria is not None else BENEFIT_CRITERIA
+    cost = cost_criteria if cost_criteria is not None else COST_CRITERIA
+
+    for col in benefit:
         if col not in df_ahp.columns:
             df_ahp[col] = 0.0
         max_val = float(df_ahp[col].max()) if len(df_ahp) else 0.0
         df_ahp[col] = _safe_divide(df_ahp[col], max_val if max_val > 0 else 1.0)
 
-    for col in COST_CRITERIA:
+    for col in cost:
         if col not in df_ahp.columns:
             df_ahp[col] = 0.0
         min_val = float(df_ahp[col].min()) if len(df_ahp) else 0.0

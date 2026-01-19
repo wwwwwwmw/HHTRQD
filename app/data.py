@@ -9,6 +9,21 @@ import pandas as pd
 import streamlit as st
 
 
+def normalize_vehicle_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    numeric_cols = out.select_dtypes(include="number").columns
+    out[numeric_cols] = out[numeric_cols].fillna(0)
+
+    for col in out.columns:
+        if out[col].dtype == "object":
+            out[col] = out[col].astype("string")
+
+    str_cols = out.select_dtypes(include="string").columns
+    out[str_cols] = out[str_cols].fillna("Unknown")
+    return out
+
+
 def _load_csv(bio: io.BytesIO, dtype: dict[str, str]) -> pd.DataFrame:
     try:
         return pd.read_csv(bio, dtype=dtype, engine="pyarrow")
@@ -38,11 +53,7 @@ def load_data_from_bytes(csv_bytes: bytes) -> pd.DataFrame:
     bio = io.BytesIO(csv_bytes)
     df = _load_csv(bio, column_types)
 
-    num_cols = df.select_dtypes(include="number").columns
-    str_cols = df.select_dtypes(include="string").columns
-    df[num_cols] = df[num_cols].fillna(0)
-    df[str_cols] = df[str_cols].fillna("Unknown")
-    return df
+    return normalize_vehicle_dataframe(df)
 
 
 @st.cache_data(show_spinner=False)

@@ -4,14 +4,52 @@
 
 Ứng dụng web minh họa quy trình AHP + AI nằm trong `streamlit_app.py`. Để chạy:
 
-```bash
-pip install -r requirements.txt  # nếu đã có danh sách phụ thuộc
-# hoặc cài đặt tối thiểu
-pip install streamlit pandas numpy scikit-learn pyarrow
+### Chạy nhanh trên Windows (không cần Activate.ps1)
 
-streamlit run streamlit_app.py
-
-python -m streamlit run streamlit_app.py --server.headless true --server.port 8501 
+```bat
+install_deps.cmd
+run_app.cmd
 ```
 
-Ứng dụng sẽ tải dữ liệu `cars.csv` (hoặc file CSV bạn upload), huấn luyện RandomForest, tính AHP (ma trận, trọng số, λ_max, CI, CR) và hiển thị bảng xếp hạng đề xuất theo thời gian thực.
+Hoặc chạy trực tiếp bằng Python trong `.venv`:
+
+```bat
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py --server.port 8501
+```
+TK
+admin/admin123
+a/123456
+
+Ứng dụng hiện dùng **PostgreSQL** làm nguồn dữ liệu (thay cho `cars.csv`), có đăng nhập với 2 role:
+
+- **Guest (chưa đăng nhập)**: vẫn dùng trang “Gợi ý xe” bình thường.
+- **User**: dùng “Gợi ý xe” + có trang “Lịch sử” (lưu các lần đề xuất).
+- **Admin**: có thêm “Dashboard”, “Thêm dữ liệu”, “Tiêu chí” (thêm/xoá/bật-tắt tiêu chí AHP và tiêu chí lọc).
+
+### 1) Cài dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2) Cấu hình PostgreSQL
+
+Thiết lập biến môi trường (khuyến nghị dùng `DATABASE_URL`):
+
+- `DATABASE_URL=postgresql+psycopg2://USER:PASSWORD@HOST:5432/DBNAME`
+
+Hoặc cấu hình từng phần:
+
+- `POSTGRES_HOST`, `POSTGRES_PORT` (mặc định 5432), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
+
+Hoặc dùng file `.env` (đã hỗ trợ tự đọc):
+
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASS`
+
+Tuỳ chọn tạo admin mặc định (nếu DB chưa có user):
+
+- `ADMIN_USERNAME` (mặc định: `admin`)
+- `ADMIN_PASSWORD` (mặc định: `admin123`)
+
+Khi chạy lần đầu, app sẽ tự tạo bảng và seed tiêu chí mặc định.
